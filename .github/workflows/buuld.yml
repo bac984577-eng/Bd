@@ -1,0 +1,497 @@
+
+===== FILE: settings.gradle.kts =====
+pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+rootProject.name = "Qalami"
+include(":app")
+
+===== FILE: build.gradle.kts =====
+plugins {
+    id("com.android.application") version "8.5.2" apply false
+    id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+}
+
+===== FILE: gradle.properties =====
+android.useAndroidX=true
+org.gradle.jvmargs=-Xmx2g
+
+===== FILE: .gitignore =====
+.gradle/
+build/
+local.properties
+.idea/
+
+===== FILE: .github/workflows/build.yml =====
+name: Build APK
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - uses: android-actions/setup-android@v3
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.7
+
+      - name: Build debug APK
+        run: gradle assembleDebug --stacktrace
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: qalami-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
+
+===== FILE: app/build.gradle.kts =====
+plugins {
+    id("com.android.application")
+    id("org.jetbrains.kotlin.android")
+}
+android {
+    namespace = "app.qalami"
+    compileSdk = 34
+    defaultConfig {
+        applicationId = "app.qalami"
+        minSdk = 24
+        targetSdk = 34
+        versionCode = 1
+        versionName = "1.0"
+    }
+    compileOptions { sourceCompatibility = JavaVersion.VERSION_17; targetCompatibility = JavaVersion.VERSION_17 }
+    kotlinOptions { jvmTarget = "17" }
+}
+dependencies {
+    implementation("com.google.mlkit:digital-ink-recognition:18.1.0")
+}
+
+===== FILE: app/src/main/AndroidManifest.xml =====
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <uses-permission android:name="android.permission.INTERNET" />
+    <application
+        android:label="@string/app_name"
+        android:icon="@android:drawable/ic_menu_edit"
+        android:supportsRtl="true"
+        android:theme="@android:style/Theme.Material.Light.NoActionBar">
+        <activity android:name=".MainActivity" android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+        <service
+            android:name=".BoardService"
+            android:exported="true"
+            android:label="@string/app_name"
+            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+            <intent-filter>
+                <action android:name="android.accessibilityservice.AccessibilityService" />
+            </intent-filter>
+            <meta-data android:name="android.accessibilityservice" android:resource="@xml/accessibility_config" />
+        </service>
+    </application>
+</manifest>
+
+===== FILE: app/src/main/res/xml/accessibility_config.xml =====
+<?xml version="1.0" encoding="utf-8"?>
+<accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+    android:accessibilityEventTypes="typeViewFocused|typeViewTextChanged|typeWindowStateChanged"
+    android:accessibilityFeedbackType="feedbackGeneric"
+    android:accessibilityFlags="flagRetrieveInteractiveWindows|flagIncludeNotImportantViews"
+    android:canRetrieveWindowContent="true"
+    android:notificationTimeout="100"
+    android:description="@string/service_desc" />
+
+===== FILE: app/src/main/res/values/strings.xml =====
+<resources>
+    <string name="app_name">قلمي</string>
+    <string name="service_desc">يعرض سبورة عائمة للكتابة بخط اليد العربي ويُدخل النص المعترف به في الحقل الذي تكتب فيه.</string>
+</resources>
+
+===== FILE: app/src/main/java/app/qalami/Recognizer.kt =====
+package app.qalami
+
+import com.google.mlkit.common.model.DownloadConditions
+import com.google.mlkit.common.model.RemoteModelManager
+import com.google.mlkit.vision.digitalink.*
+
+/** Wraps ML Kit Digital Ink (Arabic). The model downloads once, then works offline. */
+object Recognizer {
+    private val modelId = DigitalInkRecognitionModelIdentifier.fromLanguageTag("ar")!!
+    private val model = DigitalInkRecognitionModel.builder(modelId).build()
+    private val recognizer: DigitalInkRecognizer by lazy {
+        DigitalInkRecognition.getClient(DigitalInkRecognizerOptions.builder(model).build())
+    }
+
+    fun ensureModel(onState: (String) -> Unit) {
+        val mgr = RemoteModelManager.getInstance()
+        mgr.isModelDownloaded(model).addOnSuccessListener { ok ->
+            if (ok) { onState("ready"); return@addOnSuccessListener }
+            onState("downloading")
+            mgr.download(model, DownloadConditions.Builder().build())
+                .addOnSuccessListener { onState("ready") }
+                .addOnFailureListener { onState("failed") }
+        }.addOnFailureListener { onState("failed") }
+    }
+
+    fun recognize(ink: Ink, w: Float, h: Float, preContext: String,
+                  onResult: (List<String>) -> Unit, onError: () -> Unit) {
+        val ctx = RecognitionContext.builder()
+            .setPreContext(preContext.takeLast(20))
+            .setWritingArea(WritingArea(w, h))
+            .build()
+        recognizer.recognize(ink, ctx)
+            .addOnSuccessListener { r -> onResult(r.candidates.map { it.text }.filter { it.isNotBlank() }) }
+            .addOnFailureListener { onError() }
+    }
+}
+
+===== FILE: app/src/main/java/app/qalami/MainActivity.kt =====
+package app.qalami
+
+import android.app.Activity
+import android.content.Intent
+import android.graphics.Typeface
+import android.os.Bundle
+import android.provider.Settings
+import android.view.Gravity
+import android.view.View
+import android.widget.Button
+import android.widget.LinearLayout
+import android.widget.TextView
+
+class MainActivity : Activity() {
+    private lateinit var status: TextView
+
+    override fun onCreate(b: Bundle?) {
+        super.onCreate(b)
+        val tf = Typeface.createFromAsset(assets, "fonts/farah.otf")
+        val pad = (24 * resources.displayMetrics.density).toInt()
+        val root = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            layoutDirection = View.LAYOUT_DIRECTION_RTL
+            setPadding(pad, pad * 2, pad, pad)
+        }
+        fun text(s: String, size: Float) = TextView(this).apply {
+            text = s; textSize = size; typeface = tf; gravity = Gravity.START
+            textDirection = View.TEXT_DIRECTION_RTL
+            setPadding(0, 0, 0, pad / 2)
+        }
+        fun btn(s: String, f: () -> Unit) = Button(this).apply {
+            text = s; typeface = tf; textSize = 18f; setOnClickListener { f() }
+        }
+        root.addView(text("قلمي", 36f))
+        root.addView(text("سبورة عائمة تظهر فوق تطبيق الملاحظات. تكتب بخط يدك فيُدخل التطبيق النص في الحقل المفتوح.", 18f))
+        root.addView(text("1) حمّل نموذج التعرف على الخط العربي (مرة واحدة)", 17f))
+        root.addView(btn("تحميل نموذج الخط العربي") { download() })
+        status = text("", 16f); root.addView(status)
+        root.addView(text("2) فعّل الخدمة من إعدادات إمكانية الوصول ثم اختر «قلمي»", 17f))
+        root.addView(btn("فتح إعدادات إمكانية الوصول") {
+            startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
+        })
+        root.addView(text("3) افتح تطبيق الملاحظات واضغط على الحقل. ستظهر فقاعة «ق» اضغطها لفتح السبورة.", 17f))
+        setContentView(root)
+    }
+
+    private fun download() {
+        status.text = "جارٍ التحقق…"
+        Recognizer.ensureModel { s ->
+            runOnUiThread {
+                status.text = when (s) {
+                    "ready" -> "النموذج جاهز ✔"
+                    "downloading" -> "جارٍ تحميل النموذج، يلزم اتصال بالإنترنت…"
+                    else -> "فشل التحميل. تحقق من الإنترنت وأعد المحاولة."
+                }
+            }
+        }
+    }
+}
+
+===== FILE: app/src/main/java/app/qalami/BoardService.kt =====
+package app.qalami
+
+import android.accessibilityservice.AccessibilityService
+import android.annotation.SuppressLint
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.Context
+import android.graphics.*
+import android.graphics.drawable.GradientDrawable
+import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
+import android.view.*
+import android.view.accessibility.AccessibilityEvent
+import android.view.accessibility.AccessibilityNodeInfo
+import android.widget.*
+import com.google.mlkit.vision.digitalink.Ink
+
+/**
+ * Floating "smart board" shown over any app (accessibility overlay: no extra permission).
+ * Recognised text is written into the currently focused input field of the app underneath.
+ */
+class BoardService : AccessibilityService() {
+    private lateinit var wm: WindowManager
+    private lateinit var tf: Typeface
+    private val ui = Handler(Looper.getMainLooper())
+    private var bubble: TextView? = null
+    private var board: LinearLayout? = null
+    private lateinit var canvas: InkView
+    private lateinit var candRow: LinearLayout
+    private lateinit var info: TextView
+    private val dp get() = resources.displayMetrics.density
+    private var lastInserted: String? = null
+    private var recognizeTask: Runnable? = null
+
+    override fun onServiceConnected() {
+        wm = getSystemService(WINDOW_SERVICE) as WindowManager
+        tf = Typeface.createFromAsset(assets, "fonts/farah.otf")
+        Recognizer.ensureModel { }
+        buildBubble()
+    }
+
+    override fun onAccessibilityEvent(e: AccessibilityEvent?) {}
+    override fun onInterrupt() {}
+    override fun onDestroy() { bubble?.let { wm.removeView(it) }; board?.let { wm.removeView(it) }; super.onDestroy() }
+
+    private fun lp(w: Int, h: Int, gravity: Int) = WindowManager.LayoutParams(
+        w, h, WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+        // not focusable: the notes app keeps its keyboard focus and text cursor
+        WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+        PixelFormat.TRANSLUCENT).apply { this.gravity = gravity }
+
+    private fun rounded(color: Int, r: Float, stroke: Int = 0) = GradientDrawable().apply {
+        setColor(color); cornerRadius = r * dp; if (stroke != 0) setStroke((1.5f * dp).toInt(), stroke)
+    }
+
+    @SuppressLint("ClickableViewAccessibility")
+    private fun buildBubble() {
+        val b = TextView(this).apply {
+            text = "ق"; typeface = tf; textSize = 26f; gravity = Gravity.CENTER
+            setTextColor(Color.WHITE); background = rounded(0xFF0F5D63.toInt(), 28f)
+        }
+        val p = lp((56 * dp).toInt(), (56 * dp).toInt(), Gravity.TOP or Gravity.START).apply { x = (12 * dp).toInt(); y = (260 * dp).toInt() }
+        var sx = 0f; var sy = 0f; var ox = 0; var oy = 0; var moved = false
+        b.setOnTouchListener { _, ev ->
+            when (ev.action) {
+                MotionEvent.ACTION_DOWN -> { sx = ev.rawX; sy = ev.rawY; ox = p.x; oy = p.y; moved = false }
+                MotionEvent.ACTION_MOVE -> {
+                    if (Math.abs(ev.rawX - sx) > 10 || Math.abs(ev.rawY - sy) > 10) moved = true
+                    p.x = ox + (ev.rawX - sx).toInt(); p.y = oy + (ev.rawY - sy).toInt(); wm.updateViewLayout(b, p)
+                }
+                MotionEvent.ACTION_UP -> if (!moved) toggleBoard()
+            }
+            true
+        }
+        wm.addView(b, p); bubble = b
+    }
+
+    private fun toggleBoard() {
+        if (board != null) { board?.let { wm.removeView(it) }; board = null; return }
+        val root = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL; layoutDirection = View.LAYOUT_DIRECTION_RTL
+            background = rounded(0xF2FFFDF8.toInt(), 16f, 0xFF0F5D63.toInt()); setPadding(dpi(8), dpi(6), dpi(8), dpi(8))
+        }
+        info = TextView(this).apply { typeface = tf; textSize = 14f; setTextColor(0xFF4B5563.toInt()); text = "اكتب بخط يدك ثم توقف قليلًا" }
+        val head = LinearLayout(this).apply { gravity = Gravity.CENTER_VERTICAL }
+        head.addView(info, LinearLayout.LayoutParams(0, -2, 1f))
+        head.addView(chip("إخفاء") { toggleBoard() })
+        root.addView(head)
+
+        candRow = LinearLayout(this).apply { layoutDirection = View.LAYOUT_DIRECTION_RTL }
+        val hs = HorizontalScrollView(this).apply { addView(candRow); isHorizontalScrollBarEnabled = false; layoutDirection = View.LAYOUT_DIRECTION_RTL }
+        root.addView(hs, LinearLayout.LayoutParams(-1, dpi(46)))
+
+        canvas = InkView(this)
+        root.addView(canvas, LinearLayout.LayoutParams(-1, 0, 1f))
+
+        val keys = LinearLayout(this).apply { layoutDirection = View.LAYOUT_DIRECTION_RTL }
+        fun key(s: String, f: () -> Unit) = keys.addView(chip(s, f), LinearLayout.LayoutParams(0, dpi(44), 1f).apply { setMargins(dpi(3), dpi(6), dpi(3), 0) })
+        key("مسافة") { commit(" ") }
+        key("⌫") { backspace() }
+        key("سطر") { commit("\n") }
+        key("تراجع") { canvas.undo(); schedule() }
+        key("مسح") { canvas.clearAll(); candRow.removeAllViews() }
+        root.addView(keys)
+
+        canvas.onStrokeEnd = { schedule() }
+        canvas.onStrokeStart = { recognizeTask?.let(ui::removeCallbacks) }
+
+        // sits in the lower half, like a smart board docked above the keyboard
+        val p = lp(-1, (resources.displayMetrics.heightPixels * 0.5f).toInt(), Gravity.BOTTOM)
+        p.horizontalMargin = 0.02f; p.verticalMargin = 0.02f
+        wm.addView(root, p); board = root
+    }
+
+    private fun dpi(v: Int) = (v * dp).toInt()
+    private fun chip(s: String, f: () -> Unit) = TextView(this).apply {
+        text = s; typeface = tf; textSize = 18f; gravity = Gravity.CENTER; setPadding(dpi(12), 0, dpi(12), 0)
+        setTextColor(0xFF0F5D63.toInt()); background = rounded(0xFFE7EFEE.toInt(), 10f); setOnClickListener { f() }
+    }
+
+    private fun schedule() {
+        recognizeTask?.let(ui::removeCallbacks)
+        recognizeTask = Runnable { recognize() }.also { ui.postDelayed(it, 900) }
+    }
+
+    private fun recognize() {
+        val ink = canvas.buildInk() ?: return
+        info.text = "جارٍ التعرف…"
+        val pre = focusedText()
+        Recognizer.recognize(ink, canvas.width.toFloat(), canvas.height.toFloat(), pre, { list ->
+            if (list.isEmpty()) { info.text = "لم أتعرف على شيء، اكتب بوضوح أكبر"; return@recognize }
+            showCandidates(list)
+            insertWord(list[0], auto = true)
+        }, { info.text = "النموذج غير جاهز. افتح تطبيق قلمي وحمّل نموذج الخط العربي" })
+    }
+
+    private fun showCandidates(list: List<String>) {
+        candRow.removeAllViews()
+        list.forEach { w ->
+            val c = chip(w) { insertWord(w, auto = false) }
+            c.textSize = 24f   // candidates are previewed in the chosen font (Farah)
+            candRow.addView(c, LinearLayout.LayoutParams(-2, -1).apply { setMargins(dpi(3), dpi(2), dpi(3), dpi(2)) })
+        }
+    }
+
+    private fun insertWord(w: String, auto: Boolean) {
+        lastInserted?.let { replaceLast(it, w) } ?: commit(w)
+        lastInserted = w
+        canvas.clearAll()
+        info.text = if (auto) "أُدرجت «$w». اختر اقتراحًا آخر للتصحيح أو تابع الكتابة" else "تم التصحيح"
+        if (!auto) { lastInserted = null; candRow.removeAllViews() }
+    }
+
+    // --- writing into the focused field of the app underneath -------------------------------
+    private fun focusedNode(): AccessibilityNodeInfo? =
+        rootInActiveWindow?.findFocus(AccessibilityNodeInfo.FOCUS_INPUT)
+
+    private fun focusedText(): String {
+        val n = focusedNode() ?: return ""
+        return if (n.isShowingHintText) "" else (n.text?.toString() ?: "")
+    }
+
+    private fun setText(n: AccessibilityNodeInfo, text: String, cursor: Int) {
+        val a = Bundle().apply { putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, text) }
+        n.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, a)
+        val s = Bundle().apply {
+            putInt(AccessibilityNodeInfo.ACTION_ARGUMENT_SELECTION_START_INT, cursor)
+            putInt(AccessibilityNodeInfo.ACTION_ARGUMENT_SELECTION_END_INT, cursor)
+        }
+        n.performAction(AccessibilityNodeInfo.ACTION_SET_SELECTION, s)
+    }
+
+    private fun commit(s: String) {
+        lastInserted = null
+        val n = focusedNode()
+        if (n == null) { info.text = "اضغط على حقل الكتابة في تطبيقك أولًا"; return }
+        val cur = if (n.isShowingHintText) "" else (n.text?.toString() ?: "")
+        val a = if (n.textSelectionStart < 0) cur.length else n.textSelectionStart.coerceAtMost(cur.length)
+        val b = if (n.textSelectionEnd < 0) cur.length else n.textSelectionEnd.coerceAtMost(cur.length)
+        val st = minOf(a, b); val en = maxOf(a, b)
+        setText(n, cur.substring(0, st) + s + cur.substring(en), st + s.length)
+        // some apps reject ACTION_SET_TEXT: fall back to paste
+        val after = focusedNode()?.text?.toString()
+        if (after == cur && s.isNotEmpty()) {
+            val cm = getSystemService(CLIPBOARD_SERVICE) as ClipboardManager
+            cm.setPrimaryClip(ClipData.newPlainText("qalami", s)); focusedNode()?.performAction(AccessibilityNodeInfo.ACTION_PASTE)
+        }
+    }
+
+    private fun replaceLast(old: String, new: String) {
+        val n = focusedNode() ?: return
+        val cur = n.text?.toString() ?: return
+        val end = n.textSelectionEnd.takeIf { it in 0..cur.length } ?: cur.length
+        val start = end - old.length
+        if (start >= 0 && cur.substring(start, end) == old)
+            setText(n, cur.substring(0, start) + new + cur.substring(end), start + new.length)
+        else commit(new)
+    }
+
+    private fun backspace() {
+        lastInserted = null
+        val n = focusedNode() ?: return
+        val cur = n.text?.toString() ?: return
+        val a = n.textSelectionStart; val b = n.textSelectionEnd
+        if (a < 0) return
+        if (a != b) { val st = minOf(a, b); val en = maxOf(a, b); setText(n, cur.removeRange(st, en), st) }
+        else if (a > 0) setText(n, cur.removeRange(a - 1, a), a - 1)
+    }
+
+    // --- drawing surface ------------------------------------------------------------------------
+    @SuppressLint("ClickableViewAccessibility")
+    class InkView(ctx: Context) : View(ctx) {
+        private class S { val pts = ArrayList<Triple<Float, Float, Long>>() }
+        private val strokes = ArrayList<S>()
+        private var cur: S? = null
+        private var t0 = 0L
+        var onStrokeStart: () -> Unit = {}
+        var onStrokeEnd: () -> Unit = {}
+        private val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            style = Paint.Style.STROKE; strokeWidth = 4f * ctx.resources.displayMetrics.density
+            strokeCap = Paint.Cap.ROUND; strokeJoin = Paint.Join.ROUND; color = 0xFF1D2433.toInt()
+        }
+        private val guide = Paint().apply { color = 0xFFD9D4C7.toInt(); strokeWidth = 3f; pathEffect = DashPathEffect(floatArrayOf(14f, 12f), 0f) }
+        init { background = GradientDrawable().apply { setColor(0xFFFFFFFF.toInt()); cornerRadius = 12f * ctx.resources.displayMetrics.density } }
+
+        override fun onTouchEvent(e: MotionEvent): Boolean {
+            when (e.actionMasked) {
+                MotionEvent.ACTION_DOWN -> {
+                    if (strokes.isEmpty()) t0 = System.currentTimeMillis()
+                    onStrokeStart(); cur = S().also { strokes.add(it) }
+                    cur!!.pts.add(Triple(e.x, e.y, 0L))
+                }
+                MotionEvent.ACTION_MOVE -> {
+                    for (i in 0 until e.historySize) cur?.pts?.add(Triple(e.getHistoricalX(i), e.getHistoricalY(i), e.getHistoricalEventTime(i) - e.downTime + 0L))
+                    cur?.pts?.add(Triple(e.x, e.y, e.eventTime - e.downTime))
+                }
+                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> { cur = null; onStrokeEnd() }
+            }
+            invalidate(); return true
+        }
+        override fun onDraw(c: Canvas) {
+            c.drawLine(0f, height * 0.62f, width.toFloat(), height * 0.62f, guide)
+            for (s in strokes) {
+                val p = Path(); s.pts.forEachIndexed { i, t -> if (i == 0) p.moveTo(t.first, t.second) else p.lineTo(t.first, t.second) }
+                if (s.pts.size == 1) p.lineTo(s.pts[0].first + .1f, s.pts[0].second)
+                c.drawPath(p, paint)
+            }
+        }
+        fun undo() { if (strokes.isNotEmpty()) strokes.removeAt(strokes.size - 1); invalidate() }
+        fun clearAll() { strokes.clear(); invalidate() }
+        fun buildInk(): Ink? {
+            if (strokes.isEmpty()) return null
+            val ib = Ink.builder()
+            for (s in strokes) {
+                val sb = Ink.Stroke.builder()
+                s.pts.forEach { sb.addPoint(Ink.Point.create(it.first, it.second, it.third)) }
+                ib.addStroke(sb.build())
+            }
+            return ib.build()
+        }
+    }
+}
+
+===== FILE: README.md =====
+قلمي - مشروع أندرويد (Android Studio)
+1) افتح المجلد في Android Studio (Koala أو أحدث) ثم Run على هاتفك.
+2) افتح التطبيق: اضغط "تحميل نموذج الخط العربي" (مرة واحدة، يلزم إنترنت).
+3) اضغط "فتح إعدادات إمكانية الوصول" ثم فعّل "قلمي".
+   إن كان التطبيق مثبتًا من خارج المتجر وكان الخيار رماديًا: إعدادات التطبيق > ⋮ > السماح بالإعدادات المقيدة.
+4) افتح تطبيق الملاحظات، اضغط داخل مربع النص، ثم اضغط الفقاعة "ق" لتظهر السبورة العائمة.
+
+===== FILE: app/src/main/assets/fonts/farah.otf =====
+(binary font file: copy your Farah.otf here and rename it to farah.otf)
